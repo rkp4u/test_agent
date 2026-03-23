@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-forge"
+version = "0.1.0"
+description = "AI-powered test generation agent that analyzes PR diffs and generates targeted test cases"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.12"
+authors = [
+    {name = "RkP", email = "pokhriyal.rohit2@gmail.com"},
+]
+keywords = ["ai", "testing", "agent", "test-generation", "langgraph", "code-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-openai>=0.3",
+    "typer>=0.15",
+    "rich>=13",
+    "pydantic-settings>=2",
+    "pyyaml>=6",
+    "pygithub>=2",
+    "tree-sitter>=0.24",
+    "tree-sitter-language-pack>=0.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov",
+    "vcrpy>=6",
+    "ruff>=0.7",
+    "mypy>=1.12",
+    "pre-commit>=3",
+]
+semgrep = ["semgrep>=1.90"]
+
+[project.scripts]
+agent-forge = "agent_forge.cli.app:main"
+
+[project.urls]
+Homepage = "https://github.com/rkp4u/agent-forge"
+Repository = "https://github.com/rkp4u/agent-forge"
+Issues = "https://github.com/rkp4u/agent-forge/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_forge"]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: Unit tests (fast, no external dependencies)",
+    "integration: Integration tests (may need network, build tools)",
+    "e2e: End-to-end tests (slow, needs API keys and real repos)",
+]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/agent_forge"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
