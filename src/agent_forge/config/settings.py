@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     test_timeout_seconds: int = 300
     max_tests_per_run: int = 50
 
+    # Mutation testing
+    mutation_model: str = "gpt-4o-mini"
+    mutation_temperature: float = 0.7
+    equivalence_model: str = "gpt-4o-mini"
+    equivalence_temperature: float = 0.0
+    max_mutants_per_pr: int = 12
+    max_mutation_iterations: int = 2
+
     # Paths
     work_dir: Path = Path.home() / ".agent-forge" / "work"
     reports_dir: Path = Path.home() / ".agent-forge" / "reports"

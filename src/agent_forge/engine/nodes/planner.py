@@ -17,10 +17,21 @@ async def planner_node(state: AgentState) -> dict:
     return {
         "current_step": "planner",
         "iteration": 0,
-        "repo_local_path": "",  # Phase 2: actual clone path
+        "repo_local_path": "",
         "changed_files": [],
         "generated_tests": [],
         "test_results": [],
         "tests_to_fix": [],
         "messages": [],
+        # Mutation testing defaults
+        "mutants": [],
+        "filtered_mutants": [],
+        "mutation_run_results": [],
+        "surviving_mutants": [],
+        "killing_tests": [],
+        "killing_test_results": [],
+        "mutation_iteration": 0,
+        "mutation_critic_feedback": None,
+        "killing_tests_to_fix": [],
+        "mutation_score": 0.0,
     }

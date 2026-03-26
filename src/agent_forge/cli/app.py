@@ -48,20 +48,33 @@ def run(
     max_iterations: int = typer.Option(3, "--max-iterations", "-m", help="Max reflexion iterations"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed output"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Analyze and generate without running tests"),
+    mode: str = typer.Option(
+        "coverage",
+        "--mode",
+        help="Mode: 'coverage' (default) or 'mutation' (ACH-style bug detection)",
+    ),
 ) -> None:
-    """Run the full test generation pipeline: analyze → generate → test → report."""
+    """Run the full test generation pipeline: analyze → generate → test → report.
+
+    Use --mode mutation to enable mutation-guided testing (Meta ACH-style).
+    This generates realistic bugs, finds which ones your tests miss,
+    and writes targeted tests to catch them.
+    """
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(name)s: %(message)s")
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    repo = _parse_repo(repo)
+    if mode not in ("coverage", "mutation"):
+        console.print("[red]Error: --mode must be 'coverage' or 'mutation'[/]")
+        raise typer.Exit(1)
 
-    asyncio.run(_run_pipeline(repo, pr, max_iterations, verbose, dry_run))
+    repo = _parse_repo(repo)
+    asyncio.run(_run_pipeline(repo, pr, max_iterations, verbose, dry_run, mode))
 
 
 async def _run_pipeline(
-    repo: str, pr_number: int, max_iterations: int, verbose: bool, dry_run: bool
+    repo: str, pr_number: int, max_iterations: int, verbose: bool, dry_run: bool, mode: str = "coverage"
 ) -> None:
     """Execute the LangGraph pipeline with Rich progress display."""
     from agent_forge.engine.graph import compile_graph
@@ -75,7 +88,8 @@ async def _run_pipeline(
     # Print header
     print_header(repo, pr_number)
 
-    total_steps = 7
+    is_mutation = mode == "mutation"
+    total_steps = 12 if is_mutation else 7
 
     # Initial state
     initial_state = {
@@ -98,6 +112,19 @@ async def _run_pipeline(
         "messages": [],
         "current_step": "",
         "error": None,
+        # Mode
+        "mode": mode,
+        # Mutation defaults
+        "mutants": [],
+        "filtered_mutants": [],
+        "mutation_run_results": [],
+        "surviving_mutants": [],
+        "killing_tests": [],
+        "killing_test_results": [],
+        "mutation_iteration": 0,
+        "mutation_critic_feedback": None,
+        "killing_tests_to_fix": [],
+        "mutation_score": 0.0,
     }
 
     # Track step completion for display
@@ -108,8 +135,15 @@ async def _run_pipeline(
         "coverage_checker": (4, "Checking existing coverage"),
         "test_generator": (5, "Generating tests"),
         "test_runner": (6, "Running tests"),
-        "critic": (6, "Evaluating results"),  # Same step number as runner
-        "reporter": (7, "Generating report"),
+        "critic": (6, "Evaluating results"),
+        "reporter": (total_steps, "Generating report"),
+        # Mutation steps
+        "mutation_generator": (8, "Generating mutations"),
+        "equivalence_detector": (9, "Filtering equivalent mutants"),
+        "mutation_runner": (10, "Running tests against mutants"),
+        "killing_test_generator": (11, "Generating killing tests"),
+        "killing_test_runner": (11, "Running 3-stage filter"),
+        "mutation_critic": (11, "Evaluating killing tests"),
     }
 
     last_step = ""
@@ -203,8 +237,58 @@ async def _run_pipeline(
                             print_step_detail_last("[green]All tests passing[/]")
 
                     elif current_step == "critic":
-                        # Critic output is shown inline with test runner
-                        pass
+                        pass  # Shown inline with test runner
+
+                    elif current_step == "mutation_generator":
+                        mutants = node_output.get("mutants", [])
+                        print_step(step_num, total_steps, f"Generating mutations ({len(mutants)} mutants)", "done")
+                        if verbose:
+                            for m in mutants:
+                                print_step_detail(f"{m.get('mutant_id', '')}: {m.get('mutation_description', '')}")
+
+                    elif current_step == "equivalence_detector":
+                        filtered = node_output.get("filtered_mutants", [])
+                        original = len(node_output.get("mutants", filtered))
+                        removed = original - len(filtered)
+                        print_step(
+                            step_num, total_steps,
+                            f"Filtering equivalent mutants ({len(filtered)} remain, {removed} removed)",
+                            "done",
+                        )
+
+                    elif current_step == "mutation_runner":
+                        results = node_output.get("mutation_run_results", [])
+                        killed = sum(1 for r in results if r.get("killed"))
+                        survived = sum(1 for r in results if r.get("survived"))
+                        build_fail = sum(1 for r in results if r.get("build_failed"))
+                        print_step(step_num, total_steps, "Running tests against mutants", "done")
+                        print_step_detail(f"[green]{killed} killed[/], [red]{survived} survived[/], {build_fail} build failures")
+                        if survived == 0:
+                            print_step_detail_last("[green]All mutants caught by existing tests![/]")
+                        else:
+                            print_step_detail_last(f"[yellow]{survived} surviving mutant(s) need killing tests[/]")
+
+                    elif current_step == "killing_test_generator":
+                        killing = node_output.get("killing_tests", [])
+                        m_iter = node_output.get("mutation_iteration", 0)
+                        if m_iter and m_iter > 0:
+                            print_step(step_num, total_steps, f"Regenerating killing tests (iteration {m_iter + 1}/2)", "done")
+                        else:
+                            print_step(step_num, total_steps, f"Generating killing tests ({len(killing)} tests)", "done")
+
+                    elif current_step == "killing_test_runner":
+                        results = node_output.get("killing_test_results", [])
+                        accepted = sum(1 for r in results if r.get("accepted"))
+                        rejected = len(results) - accepted
+                        print_step(step_num, total_steps, "3-stage filter (Build → Pass original → Fail mutant)", "done")
+                        print_step_detail(f"[green]{accepted} accepted[/], [red]{rejected} failed[/]")
+                        if rejected > 0:
+                            print_step_detail_last("[yellow]Entering mutation reflexion loop...[/]")
+
+                    elif current_step == "mutation_critic":
+                        score = node_output.get("mutation_score", 0.0)
+                        if score > 0:
+                            print_step_detail_last(f"Mutation score: [green]{score:.0%}[/]")
 
                     elif current_step == "reporter":
                         print_step(step_num, total_steps, "Generating report", "done")

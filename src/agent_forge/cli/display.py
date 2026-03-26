@@ -129,10 +129,74 @@ def print_report(report: dict) -> None:
         for s in suggestions:
             console.print(f"  [dim]•[/] {s}")
 
+    # Mutation testing report (if mutation mode)
+    mutation = report.get("mutation")
+    if mutation:
+        _print_mutation_report(mutation)
+
     console.print()
     console.print(
         f"[dim]Report generated using {report.get('tool_calls', 0)} tool calls.[/]"
     )
+
+
+def _print_mutation_report(mutation: dict) -> None:
+    """Print the mutation testing section of the report."""
+    score = mutation.get("mutation_score", 0.0)
+    score_color = "green" if score >= 0.8 else "yellow" if score >= 0.5 else "red"
+
+    console.print()
+
+    # Mutation score summary
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(justify="right", style="dim")
+    summary.add_column()
+
+    summary.add_row(
+        "Mutation score:",
+        f"[bold {score_color}]{score:.0%}[/]"
+        f" ({mutation.get('killed_by_existing', 0) + mutation.get('killed_by_new', 0)}"
+        f"/{mutation.get('mutants_tested', 0)} mutants killed)",
+    )
+    summary.add_row(
+        "Killed by existing:",
+        f"[green]{mutation.get('killed_by_existing', 0)}[/]",
+    )
+    summary.add_row(
+        "Killed by new tests:",
+        f"[green]{mutation.get('killed_by_new', 0)}[/]",
+    )
+    survived = mutation.get("survived", 0)
+    summary.add_row(
+        "Still surviving:",
+        f"[red]{survived}[/]" if survived > 0 else "[green]0[/]",
+    )
+    summary.add_row(
+        "Equivalent (filtered):",
+        f"[dim]{mutation.get('equivalent_filtered', 0)}[/]",
+    )
+
+    console.print(Panel(summary, title="[bold]Mutation Testing Results[/]", border_style="blue"))
+
+    # Surviving mutants detail
+    surviving = mutation.get("surviving_mutant_details", [])
+    if surviving:
+        table = Table(
+            title="[yellow]Surviving Mutants — Not Caught by Tests[/]",
+            show_header=True,
+            border_style="yellow",
+        )
+        table.add_column("ID", style="dim", width=6)
+        table.add_column("Type", style="cyan", width=18)
+        table.add_column("Description")
+
+        for m in surviving:
+            table.add_row(
+                m.get("mutant_id", ""),
+                m.get("mutation_type", ""),
+                m.get("mutation_description", ""),
+            )
+        console.print(table)
 
 
 def print_error(message: str) -> None:

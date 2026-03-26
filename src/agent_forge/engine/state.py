@@ -45,6 +45,21 @@ class AgentState(TypedDict):
     # --- LLM Tracking ---
     messages: Annotated[list, add_messages]
 
+    # --- Mode ---
+    mode: str  # "coverage" | "mutation" (default: "coverage")
+
+    # --- Mutation Testing ---
+    mutants: list[dict]             # Generated mutations [{mutant_id, file_path, original_code, mutated_code, ...}]
+    filtered_mutants: list[dict]    # After equivalence detection
+    mutation_run_results: list[dict]  # [{mutant_id, killed, killing_test, survived}]
+    surviving_mutants: list[dict]   # Mutants no existing test caught
+    killing_tests: list[dict]       # Tests targeting specific mutants
+    killing_test_results: list[dict]  # [{test_name, mutant_id, builds, passes_original, fails_mutant, accepted}]
+    mutation_iteration: int         # Separate reflexion counter for killing tests (max 2)
+    mutation_critic_feedback: str | None
+    killing_tests_to_fix: list[dict]
+    mutation_score: float           # killed / total_non_equivalent
+
     # --- Status ---
     current_step: str
     error: str | None
