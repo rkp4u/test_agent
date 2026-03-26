@@ -12,6 +12,7 @@ from agent_forge.engine.prompts.mutation import (
     KILLING_TEST_SYSTEM_PROMPT,
     build_killing_test_prompt,
 )
+from agent_forge.tools.github.client import GitHubClient
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ async def killing_test_generator_node(state: AgentState) -> dict:
       - FAILS on the mutated (buggy) code
 
     Uses the primary model (gpt-4o) at low temperature (0.2) for precision.
+    CRITICAL: Fetches full source code of target classes for test generation context.
     """
     settings = get_settings()
     surviving_mutants = state.get("surviving_mutants", [])
@@ -32,6 +34,8 @@ async def killing_test_generator_node(state: AgentState) -> dict:
     mutation_critic_feedback = state.get("mutation_critic_feedback")
     killing_tests_to_fix = state.get("killing_tests_to_fix", [])
     previous_killing_tests = state.get("killing_tests", [])
+    pr_diff = state.get("pr_diff", {})
+    repo = state.get("repo", "")
 
     if not surviving_mutants:
         logger.info("No surviving mutants — no killing tests needed")
@@ -55,6 +59,25 @@ async def killing_test_generator_node(state: AgentState) -> dict:
             "killing_tests": _mock_killing_tests(surviving_mutants),
         }
 
+    # Fetch full source code for all files containing mutants (CRITICAL for test generation)
+    file_contents = {}
+    if repo and settings.github_token:
+        try:
+            client = GitHubClient(github_token=settings.github_token)
+            head_ref = pr_diff.get("head_ref", "")
+            # Get unique file paths from surviving mutants
+            mutant_files = set(m["file_path"] for m in surviving_mutants)
+            for file_path in mutant_files:
+                try:
+                    content = await client.get_file_content(repo, file_path, ref=head_ref)
+                    if content:
+                        file_contents[file_path] = content
+                        logger.debug(f"Fetched source for killing test context: {file_path}")
+                except Exception as e:
+                    logger.debug(f"Could not fetch {file_path}: {e}")
+        except Exception as e:
+            logger.debug(f"Could not fetch file contents for killing test context: {e}")
+
     try:
         killing_tests = await _generate_killing_tests(
             settings=settings,
@@ -63,6 +86,7 @@ async def killing_test_generator_node(state: AgentState) -> dict:
             critic_feedback=mutation_critic_feedback,
             tests_to_fix=killing_tests_to_fix,
             previous_tests=previous_killing_tests,
+            file_contents=file_contents,
         )
         logger.info(f"Generated {len(killing_tests)} killing test files")
         return {
@@ -84,8 +108,13 @@ async def _generate_killing_tests(
     critic_feedback: str | None,
     tests_to_fix: list[dict],
     previous_tests: list[dict],
+    file_contents: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Use LLM to generate killing tests for surviving mutants."""
+    """Use LLM to generate killing tests for surviving mutants.
+
+    Args:
+        file_contents: Full source code of target files (critical for test generation).
+    """
     llm = ChatOpenAI(
         model=settings.model,
         temperature=settings.temperature,
@@ -98,6 +127,7 @@ async def _generate_killing_tests(
         critic_feedback=critic_feedback,
         tests_to_fix=tests_to_fix,
         previous_tests=previous_tests,
+        file_contents=file_contents,
     )
 
     response = await llm.ainvoke([

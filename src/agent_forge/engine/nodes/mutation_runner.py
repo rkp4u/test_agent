@@ -20,9 +20,6 @@ async def mutation_runner_node(state: AgentState) -> dict:
       3. If any test fails → mutant is KILLED
       4. If all tests pass → mutant SURVIVES (needs a killing test)
       5. Restore source file (guaranteed by MutationInjector context manager)
-
-    Skips mutants whose source file isn't found or whose original_code snippet
-    doesn't match (e.g. LLM hallucinated the snippet).
     """
     settings = get_settings()
     filtered_mutants = state.get("filtered_mutants", [])
@@ -42,7 +39,7 @@ async def mutation_runner_node(state: AgentState) -> dict:
 
     repo_path = Path(repo_local_path)
     if not (repo_path / "gradlew").exists():
-        logger.warning("No gradlew found — using mock mutation run results")
+        logger.warning(f"No gradlew at {repo_path} — using mock mutation run results")
         return _mock_results(filtered_mutants)
 
     injector = MutationInjector(repo_path)
@@ -55,18 +52,19 @@ async def mutation_runner_node(state: AgentState) -> dict:
             mutant_id = mutant["mutant_id"]
             logger.info(f"Testing mutant {mutant_id}: {mutant['mutation_description']}")
 
-            async with _inject_and_run(injector, runner, mutant, settings) as run_result:
-                results.append(run_result)
-                if run_result.get("survived"):
-                    surviving_mutants.append(mutant)
-                    logger.info(f"  ↳ SURVIVED: {mutant_id} — no existing test catches this bug")
-                elif run_result.get("build_failed"):
-                    logger.info(f"  ↳ BUILD FAILED: {mutant_id} — mutant doesn't compile (skipped)")
-                else:
-                    logger.info(f"  ↳ KILLED by: {run_result.get('killing_test', 'existing tests')}")
+            run_result = await _run_single_mutant(injector, runner, mutant, settings)
+            results.append(run_result)
+
+            if run_result.get("build_failed"):
+                logger.info(f"  ↳ BUILD FAILED: {mutant_id} — mutant doesn't compile (skipped)")
+            elif run_result.get("killed"):
+                logger.info(f"  ↳ KILLED by: {run_result.get('killing_test', 'existing tests')}")
+            else:
+                surviving_mutants.append(mutant)
+                logger.info(f"  ↳ SURVIVED: {mutant_id} — no existing test catches this bug")
 
     finally:
-        injector.restore_all()  # Emergency restore if anything went wrong
+        injector.restore_all()
 
     killed = sum(1 for r in results if r.get("killed"))
     survived = len(surviving_mutants)
@@ -82,83 +80,8 @@ async def mutation_runner_node(state: AgentState) -> dict:
     }
 
 
-class _inject_and_run:
-    """Async context manager that injects mutant, runs tests, yields result."""
-
-    def __init__(self, injector, runner, mutant, settings):
-        self.injector = injector
-        self.runner = runner
-        self.mutant = mutant
-        self.settings = settings
-        self._result = {}
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-    def __await__(self):
-        return self._run().__await__()
-
-    async def _run(self):
-        mutant = self.mutant
-        mutant_id = mutant["mutant_id"]
-
-        with self.injector.inject_mutant(mutant) as injected:
-            if not injected:
-                return {
-                    "mutant_id": mutant_id,
-                    "killed": False,
-                    "survived": False,
-                    "build_failed": True,
-                    "killing_test": None,
-                }
-
-            try:
-                result = await self.runner.run_tests(
-                    timeout=self.settings.test_timeout_seconds
-                )
-
-                if not result.success and result.compilation_errors:
-                    return {
-                        "mutant_id": mutant_id,
-                        "killed": False,
-                        "survived": False,
-                        "build_failed": True,
-                        "killing_test": None,
-                    }
-
-                failed_tests = [t for t in result.test_results if not t.get("passed")]
-                if failed_tests:
-                    return {
-                        "mutant_id": mutant_id,
-                        "killed": True,
-                        "survived": False,
-                        "build_failed": False,
-                        "killing_test": failed_tests[0].get("test_name"),
-                    }
-                else:
-                    return {
-                        "mutant_id": mutant_id,
-                        "killed": False,
-                        "survived": True,
-                        "build_failed": False,
-                        "killing_test": None,
-                    }
-            except Exception as e:
-                logger.warning(f"Test run failed for mutant {mutant_id}: {e}")
-                return {
-                    "mutant_id": mutant_id,
-                    "killed": False,
-                    "survived": True,
-                    "build_failed": False,
-                    "killing_test": None,
-                }
-
-
-async def _inject_and_run_mutant(injector, runner, mutant, settings) -> dict:
-    """Run tests against a single mutant and return the result dict."""
+async def _run_single_mutant(injector: MutationInjector, runner: GradleRunner, mutant: dict, settings) -> dict:
+    """Inject a single mutant, run tests, restore, return result dict."""
     mutant_id = mutant["mutant_id"]
 
     with injector.inject_mutant(mutant) as injected:
@@ -174,7 +97,8 @@ async def _inject_and_run_mutant(injector, runner, mutant, settings) -> dict:
         try:
             result = await runner.run_tests(timeout=settings.test_timeout_seconds)
 
-            if not result.success and result.compilation_errors:
+            # If compilation failed, treat as build failure
+            if hasattr(result, "compilation_errors") and result.compilation_errors:
                 return {
                     "mutant_id": mutant_id,
                     "killed": False,
@@ -183,7 +107,9 @@ async def _inject_and_run_mutant(injector, runner, mutant, settings) -> dict:
                     "killing_test": None,
                 }
 
-            failed_tests = [t for t in result.test_results if not t.get("passed")]
+            test_results = result.test_results if hasattr(result, "test_results") else []
+            failed_tests = [t for t in test_results if not t.get("passed")]
+
             if failed_tests:
                 return {
                     "mutant_id": mutant_id,
@@ -200,8 +126,9 @@ async def _inject_and_run_mutant(injector, runner, mutant, settings) -> dict:
                     "build_failed": False,
                     "killing_test": None,
                 }
+
         except Exception as e:
-            logger.warning(f"Test run failed for mutant {mutant_id}: {e}")
+            logger.warning(f"Test run error for mutant {mutant_id}: {e}")
             return {
                 "mutant_id": mutant_id,
                 "killed": False,
@@ -216,14 +143,13 @@ def _mock_results(mutants: list[dict]) -> dict:
     results = []
     surviving = []
     for m in mutants:
-        result = {
+        results.append({
             "mutant_id": m["mutant_id"],
             "killed": False,
             "survived": True,
             "build_failed": False,
             "killing_test": None,
-        }
-        results.append(result)
+        })
         surviving.append(m)
 
     logger.info(f"Mock: {len(surviving)} mutants survive (no real test run)")

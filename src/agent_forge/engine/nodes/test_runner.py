@@ -133,15 +133,16 @@ async def test_runner_node(state: AgentState) -> dict:
 
         return {
             "current_step": "test_runner",
+            "repo_local_path": str(repo_path),
             "test_results": result.test_results,
-            "new_coverage": None,  # Phase 4+: collect JaCoCo coverage after run
+            "new_coverage": None,
         }
 
     except Exception as e:
         logger.error(f"Test execution failed: {e}")
-        # Fall back to reporting the error
         return {
             "current_step": "test_runner",
+            "repo_local_path": str(repo_path) if repo_path else state.get("repo_local_path", ""),
             "test_results": [{
                 "test_name": "execution_error",
                 "passed": False,

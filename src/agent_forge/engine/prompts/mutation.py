@@ -155,6 +155,7 @@ You will be given:
 1. A description of a specific bug (mutation) in the code
 2. The original (correct) code snippet
 3. The mutated (buggy) code snippet
+4. FULL SOURCE CODE of the target class (use this for exact method signatures and imports)
 
 Your task: Write a JUnit 5 test that:
 - PASSES when run against the original (correct) code
@@ -164,10 +165,19 @@ Your task: Write a JUnit 5 test that:
 1. The test MUST pass on the original code — it cannot break working behavior.
 2. The test MUST fail on the buggy code — it must specifically detect this bug.
 3. Never access private fields or methods — use only public API.
-4. Always include the full package declaration and all necessary imports.
-5. Use JUnit 5 + Mockito. Arrange/Act/Assert pattern.
-6. The assertion must directly validate the behavior that the mutation breaks.
-7. Test class name: <TargetClass>MutationTest.
+4. ALWAYS include ALL required imports from the full source code (especially java.util, java.util.concurrent, etc).
+5. Study the FULL SOURCE CODE section to determine EXACT method signatures and constructor parameters.
+6. Copy the package declaration from the full source code — do NOT guess.
+7. Use JUnit 5. Arrange/Act/Assert pattern. No Mockito unless class has Spring dependencies.
+8. The assertion must directly validate the behavior that the mutation breaks.
+9. Test class name: <TargetClass>MutationTest.
+
+## Avoiding Compilation Errors
+- ONLY call methods with ZERO parameters if source shows `public X methodName()` (no params)
+- If source shows `public X methodName(String s, int i)`, ALWAYS provide those exact parameters
+- If constructor is not shown or uses Spring @Component, use no-arg constructor
+- Never import classes that don't exist (e.g., don't use `Map.Entry` without importing `java.util.*`)
+- Copy constructor invocation EXACTLY as shown in source code examples
 
 ## Output Format
 Return a JSON array. One test file per surviving mutant. No prose.
@@ -175,7 +185,7 @@ Return a JSON array. One test file per surviving mutant. No prose.
 [
   {
     "file_path": "src/test/java/com/example/ServiceMutationTest.java",
-    "content": "package com.example;\\n\\nimport ...",
+    "content": "package com.example;\\n\\nimport org.junit.jupiter.api.Test;\\n\\npublic class ServiceMutationTest { ... }",
     "target_class": "Service",
     "test_methods": ["testRetryLimitEnforced_M001"],
     "target_mutant_id": "M001",
@@ -190,8 +200,16 @@ def build_killing_test_prompt(
     critic_feedback: str | None = None,
     tests_to_fix: list[dict] | None = None,
     previous_tests: list[dict] | None = None,
+    file_contents: dict[str, str] | None = None,
 ) -> str:
-    """Build user prompt for killing test generation."""
+    """Build user prompt for killing test generation.
+
+    CRITICAL: Include full source code of target classes to help LLM understand:
+    - Class structure, constructors, fields
+    - Dependencies and how to inject them
+    - Package declaration and required imports
+    - Public API surface area
+    """
     parts = []
 
     if critic_feedback and tests_to_fix:
@@ -207,9 +225,36 @@ def build_killing_test_prompt(
         "Each test must PASS on original code and FAIL on the mutated (buggy) code.\n"
     )
 
-    # Only target the mutants that need fixing on reflexion, or all survivors on first pass
+    # Collect unique files that contain the mutants
+    mutant_files = {}
     target_ids = {t.get("mutant_id") for t in (tests_to_fix or [])} if tests_to_fix else None
 
+    for m in surviving_mutants:
+        if target_ids and m["mutant_id"] not in target_ids:
+            continue
+        mutant_files[m['file_path']] = m
+
+    # Include FULL SOURCE CODE for all target files (crucial for test generation)
+    if file_contents:
+        parts.append("# Full Source Code of Target Classes\n")
+        parts.append("⚠️  COPY imports and method signatures EXACTLY as shown below.\n")
+        parts.append("Do NOT guess or simplify method signatures.\n\n")
+        for file_path, content in file_contents.items():
+            # Only include files with mutants
+            if any(m['file_path'] == file_path for m in surviving_mutants):
+                parts.append(f"## {file_path}\n```java\n{content}\n```\n")
+
+                # Extract and highlight key parts for clarity
+                lines = content.split('\n')
+                imports = [l for l in lines if l.strip().startswith('import ')]
+                if imports:
+                    parts.append(f"**Imports needed:**\n")
+                    for imp in imports[:10]:  # Show first 10 imports
+                        parts.append(f"  {imp.strip()}")
+                    parts.append("")
+
+    # Now show each specific mutant with context
+    parts.append("# Mutants Requiring Killing Tests\n")
     for m in surviving_mutants:
         if target_ids and m["mutant_id"] not in target_ids:
             continue
@@ -232,16 +277,28 @@ def build_killing_test_prompt(
             parts.extend(diff_lines)
         parts.append("")
 
-    # Code analysis context
-    parts.append("# Code Analysis\n")
+    # Code analysis context — method signatures and class structure
+    parts.append("# Class Structure Reference\n")
     for fa in code_analysis.get("files", []):
         for cls in fa.get("classes", []):
+            parts.append(f"\n## Class: {cls.get('name', '')}")
+            parts.append(f"Package: {cls.get('package', 'unknown')}")
+
+            # Dependencies for mocking/injection
             deps = cls.get("dependencies", [])
-            parts.append(f"Class {cls.get('name', '')} depends on: {', '.join(deps)}")
+            if deps:
+                parts.append(f"Dependencies: {', '.join(deps)}")
+
+            # Constructor info (critical for test setup)
+            parts.append("\nConstructor signature:")
+            parts.append(f"  {cls.get('name', '')}({', '.join(p.get('type', '') + ' ' + p.get('name', '') for p in cls.get('constructor_params', []))})")
+
+            # Public methods
+            parts.append("\nPublic methods:")
             for method in cls.get("methods", []):
+                params_str = ', '.join(f"{p.get('type', '')} {p.get('name', '')}" for p in method.get('parameters', []))
                 parts.append(
-                    f"  public {method.get('return_type', 'void')} {method.get('name', '')}("
-                    f"{', '.join(p.get('type', '') for p in method.get('parameters', []))})"
+                    f"  {method.get('return_type', 'void')} {method.get('name', '')}({params_str})"
                 )
 
     # Preserve passing tests from previous iteration
