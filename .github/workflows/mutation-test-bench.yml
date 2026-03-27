@@ -21,6 +21,10 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
+permissions:
+  contents: read
+  issues: write
+
 env:
   PYTHON_VERSION: '3.12'
 
