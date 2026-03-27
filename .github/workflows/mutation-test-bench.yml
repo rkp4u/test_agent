@@ -1,0 +1,240 @@
+name: Mutation Test Benchmark
+
+on:
+  # Manual trigger with customizable inputs
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'JSON array of {repo, pr} to test (leave empty for default matrix)'
+        required: false
+        default: ''
+      mode:
+        description: 'Agent mode: coverage or mutation'
+        required: false
+        default: 'mutation'
+        type: choice
+        options:
+          - mutation
+          - coverage
+
+  # Weekly schedule — runs every Monday at 6am UTC
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Step 1: Build the test matrix (default or custom)
+  # ---------------------------------------------------------------------------
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set test matrix
+        id: set-matrix
+        run: |
+          if [ -n "${{ github.event.inputs.repos }}" ]; then
+            echo "matrix=${{ github.event.inputs.repos }}" >> "$GITHUB_OUTPUT"
+          else
+            # Default benchmark repos — curated for varying complexity
+            cat <<'EOF' >> "$GITHUB_OUTPUT"
+          matrix=[{"repo":"spring-projects/spring-petclinic","pr":2310,"build":"gradle","complexity":"medium","description":"Spring MVC + JPA pet clinic"},{"repo":"thombergs/buckpal","pr":46,"build":"gradle","complexity":"small","description":"Hexagonal architecture example"},{"repo":"google/gson","pr":3000,"build":"maven","complexity":"large","description":"Google JSON serialization library"},{"repo":"iluwatar/java-design-patterns","pr":3454,"build":"maven","complexity":"large","description":"Design patterns in Java"}]
+          EOF
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Step 2: Run agent-forge against each repo/PR in parallel
+  # ---------------------------------------------------------------------------
+  run-benchmark:
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false  # Don't cancel other jobs if one fails
+      matrix:
+        target: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout agent-forge
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install agent-forge
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run agent-forge (${{ matrix.target.repo }} PR#${{ matrix.target.pr }})
+        id: run-forge
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'mutation' }}"
+          REPO="${{ matrix.target.repo }}"
+          PR="${{ matrix.target.pr }}"
+
+          echo "::group::Running agent-forge on ${REPO} PR#${PR} (mode: ${MODE})"
+
+          START_TIME=$(date +%s)
+
+          # Run and capture output + exit code
+          agent-forge run "${REPO}" --pr "${PR}" --mode "${MODE}" \
+            --max-iterations 2 \
+            2>&1 | tee /tmp/agent-forge-output.txt || true
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          echo "::endgroup::"
+
+          # Write results metadata
+          cat <<RESULT_EOF > /tmp/result.json
+          {
+            "repo": "${REPO}",
+            "pr": ${PR},
+            "mode": "${MODE}",
+            "build_system": "${{ matrix.target.build }}",
+            "complexity": "${{ matrix.target.complexity }}",
+            "description": "${{ matrix.target.description }}",
+            "duration_seconds": ${DURATION},
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          RESULT_EOF
+
+          echo "duration=${DURATION}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ strategy.job-index }}
+          path: |
+            /tmp/result.json
+            /tmp/agent-forge-output.txt
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Step 3: Aggregate results and create GitHub Issue report
+  # ---------------------------------------------------------------------------
+  report:
+    needs: run-benchmark
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
+
+      - name: Generate report and create issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Aggregate all result.json files
+          python3 << 'PYTHON_EOF'
+          import json, glob, os
+
+          results = []
+          for f in sorted(glob.glob("results/result-*/result.json")):
+              with open(f) as fh:
+                  results.append(json.load(fh))
+
+          # Build markdown table
+          rows = []
+          total_time = 0
+          for r in results:
+              dur = r.get("duration_seconds", 0)
+              total_time += dur
+              mins = dur // 60
+              secs = dur % 60
+              rows.append(
+                  f"| {r['repo']} | #{r['pr']} | {r['build_system']} | "
+                  f"{r['complexity']} | {r['mode']} | {mins}m{secs:02d}s |"
+              )
+
+          table = "\n".join(rows)
+          total_mins = total_time // 60
+          total_secs = total_time % 60
+
+          # Collect console outputs for details section
+          details = []
+          for i, r in enumerate(results):
+              output_file = f"results/result-{i}/agent-forge-output.txt"
+              output = ""
+              if os.path.exists(output_file):
+                  with open(output_file) as fh:
+                      output = fh.read()[-3000:]  # Last 3000 chars
+              details.append(f"""
+          <details>
+          <summary>{r['repo']} PR#{r['pr']}</summary>
+
+          ```
+          {output}
+          ```
+          </details>
+          """)
+
+          details_section = "\n".join(details)
+
+          body = f"""## Mutation Test Benchmark Report
+
+          **Run date:** {results[0].get('timestamp', 'unknown') if results else 'N/A'}
+          **Total wall time:** {total_mins}m{total_secs:02d}s (parallel execution)
+          **Repos tested:** {len(results)}
+
+          ### Results Summary
+
+          | Repo | PR | Build | Complexity | Mode | Duration |
+          |------|-----|-------|------------|------|----------|
+          {table}
+
+          ### Detailed Output
+
+          {details_section}
+
+          ### Next Steps
+
+          - [ ] Review surviving mutants for test improvement opportunities
+          - [ ] Check killing test compilation success rate
+          - [ ] Compare mutation scores across repos
+          - [ ] Update prompt templates if pattern failures detected
+
+          ---
+          *Auto-generated by agent-forge benchmark pipeline*
+          """
+
+          with open("/tmp/issue-body.md", "w") as f:
+              f.write(body)
+
+          with open("/tmp/issue-title.txt", "w") as f:
+              f.write(f"Benchmark Report: {len(results)} repos tested ({results[0].get('timestamp', '')[:10] if results else 'unknown'})")
+          PYTHON_EOF
+
+          # Create GitHub issue with the report
+          TITLE=$(cat /tmp/issue-title.txt)
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "${TITLE}" \
+            --body-file /tmp/issue-body.md \
+            --label "benchmark,automated"
